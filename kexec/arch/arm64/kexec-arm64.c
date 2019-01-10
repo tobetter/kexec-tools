@@ -45,6 +45,9 @@ unsigned char reuse_initrd;
 off_t initrd_base;
 off_t initrd_size;
 
+static const char n_memory[] = "/memory";
+static const char p_memory[] = "memory";
+
 const struct arch_map_entry arches[] = {
 	{ "aarch64", KEXEC_ARCH_ARM64 },
 	{ "aarch64_be", KEXEC_ARCH_ARM64 },
@@ -592,6 +595,95 @@ unsigned long arm64_locate_kernel_segment(struct kexec_info *info)
 	return hole;
 }
 
+int fdt_set_memory(struct kexec_info *info, struct dtb *dtb)
+{
+	char *new_dtb = NULL;
+	int nodeoffset;
+	int result;
+	int i;
+	int memory_ranges = 0;
+	uint32_t address_cells, size_cells;
+	void *buf, *prop;
+	size_t range_len;
+
+	result = fdt_check_header(dtb->buf);
+	if (result) {
+		fprintf(stderr, "kexec: Invalid 2nd device tree.\n");
+		return EFAILED;
+	}
+
+	nodeoffset = fdt_path_offset(dtb->buf, "/memory");
+	if (nodeoffset < 0) {
+		int new_size = FDT_TAGALIGN(fdt_totalsize(dtb->buf)
+				+ fdt_node_len(n_memory));
+
+		new_dtb = xmalloc(new_size);
+
+		result = fdt_open_into(dtb->buf, new_dtb, new_size);
+		if (result) {
+			dbgprintf("%s: fdt_open_into failed: %s\n", __func__,
+					fdt_strerror(result));
+			result = -ENOSPC;
+			goto on_error;
+		}
+
+		nodeoffset = fdt_add_subnode(new_dtb, 0, p_memory);
+		if (nodeoffset < 0) {
+			dbgprintf("%s: add /memory %s\n", __func__,
+					fdt_strerror(nodeoffset));
+			result = -EINVAL;
+			goto on_error;
+		}
+
+		fdt_pack(new_dtb);
+		dtb->buf = new_dtb;
+		dtb->size = fdt_totalsize(new_dtb);
+	}
+
+	/* determine #address-cells and #size-cells */
+	result = get_cells_size(dtb->buf, &address_cells, &size_cells);
+	if (result) {
+		fprintf(stderr, "kexec: cannot determine cells-size.\n");
+		return -EINVAL;
+	}
+
+	result = dtb_set_property(&dtb->buf, &dtb->size, n_memory,
+			"device_type", p_memory, strlen(p_memory) + 1);
+	if (result < 0)
+		return result;
+
+	/* fill up the memory ranges */
+	range_len = sizeof(uint32_t) * (address_cells + size_cells);
+
+	prop = buf = xmalloc(range_len * info->memory_ranges);
+	for (i = 0; i < info->memory_ranges; i++) {
+		fill_property(prop, info->memory_range[i].start, address_cells);
+		prop += address_cells * sizeof(uint32_t);
+
+		fill_property(prop, info->memory_range[i].end
+				- info->memory_range[i].start + 1, size_cells);
+		prop += address_cells * sizeof(uint32_t);
+
+		memory_ranges++;
+	}
+
+	result = dtb_set_property(&dtb->buf, &dtb->size, n_memory,
+			"reg", buf, range_len * memory_ranges);
+	free(buf);
+
+	if (result < 0)
+		dtb_delete_property(dtb->buf, n_memory, "device_type");
+
+	return result;
+
+on_error:
+	fprintf(stderr, "kexec: %s failed.\n", __func__);
+	if (new_dtb)
+		free(new_dtb);
+
+	return result;
+}
+
 /**
  * arm64_load_other_segments - Prepare the dtb, initrd and purgatory segments.
  */
@@ -639,6 +731,9 @@ int arm64_load_other_segments(struct kexec_info *info,
 
 	if (result)
 		return EFAILED;
+
+	/* TODO: fixup '/memory' to fill up */
+	fdt_set_memory(info, &dtb);
 
 	/* Put the other segments after the image. */
 
